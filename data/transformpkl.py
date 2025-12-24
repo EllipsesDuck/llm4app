@@ -1,4 +1,4 @@
-from prepare import *
+from data.src.prepare import *
 
 from IPython.display import Image # IPython display
 pd.set_option('display.max_rows', None, 'display.max_columns', None)
