@@ -1,150 +1,510 @@
-import os
-from typing import List, Optional, Union
+import math
+from typing import List, Optional, Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers import AutoTokenizer, AutoModel
-import torchvision
-import torchvision.transforms as T
-from PIL import Image
+
+class SoftCategoryEmbeddingRegFast(nn.Module):
+    def __init__(
+        self,
+        num_classes: int,
+        embed_dim: int,
+        temperature: float = 1.0,
+        reg_weights: Optional[dict] = None,
+        sim_matrix: Optional[torch.Tensor] = None,
+        stein_eps: float = 1e-4,
+        reg_every: int = 1,
+        use_laplacian_trace: bool = True,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        self.temperature = float(temperature)
+        self.stein_eps = float(stein_eps)
+        self.reg_every = int(reg_every)
+        self.use_laplacian_trace = bool(use_laplacian_trace)
+
+        self.E = nn.Parameter(torch.randn(num_classes, embed_dim) * 0.02)
+        self.W = nn.Parameter(torch.randn(num_classes, num_classes) * 0.02)
+
+        weights = {"ent": 0.0, "lap": 0.0, "stein": 0.0}
+        if reg_weights:
+            weights.update(reg_weights)
+        self.reg_weights = weights
+
+        S = sim_matrix if sim_matrix is not None else torch.eye(num_classes)
+        self.register_buffer("S", S)
+
+        if self.use_laplacian_trace:
+            with torch.no_grad():
+                d = S.sum(dim=-1)
+                L = torch.diag(d) - S
+            self.register_buffer("L", L)
+        else:
+            self.L = None
+
+        self.register_buffer("_step", torch.zeros((), dtype=torch.long))
+
+    def forward(self, idx: torch.LongTensor):
+        Tmix = F.softmax(self.W / self.temperature, dim=-1)
+        p = Tmix[idx]
+        e = p @ self.E
+
+        self._step += 1
+        if self.reg_every > 1 and int(self._step.item()) % self.reg_every != 0:
+            reg_loss = e.new_zeros(())
+        else:
+            reg_loss = self._regularization(Tmix)
+
+        return e, reg_loss
+
+    def _regularization(self, Tmix: torch.Tensor) -> torch.Tensor:
+        reg = Tmix.new_zeros(())
+        V = self.num_classes
+
+        w_ent = self.reg_weights.get("ent", 0.0)
+        if w_ent != 0.0:
+            entropy = -(Tmix * torch.log(Tmix.clamp_min(1e-8))).sum(dim=-1).mean()
+            reg = reg + w_ent * entropy
+
+        w_lap = self.reg_weights.get("lap", 0.0)
+        if w_lap != 0.0:
+            if self.use_laplacian_trace:
+                LE = self.L @ self.E
+                tr = torch.sum(self.E * LE)
+                lap = (2.0 * tr) / (V * V)
+            else:
+                diff = self.E.unsqueeze(0) - self.E.unsqueeze(1)
+                dist2 = (diff ** 2).sum(-1)
+                lap = (self.S * dist2).sum() / (V * V)
+            reg = reg + w_lap * lap
+
+        w_stein = self.reg_weights.get("stein", 0.0)
+        if w_stein != 0.0:
+            E0 = self.E - self.E.mean(0, keepdim=True)
+            cov = (E0.t() @ E0) / V
+            cov = cov + self.stein_eps * torch.eye(
+                cov.size(0), device=cov.device, dtype=cov.dtype
+            )
+            Lc = torch.linalg.cholesky(cov)
+            sol = torch.cholesky_solve(E0.t(), Lc).t()
+            score = -sol
+            stein = -torch.mean(torch.sum(score * E0, dim=-1))
+            reg = reg + w_stein * stein
+
+        return reg
 
 
-# Categorical Features
 class SoftCategoryEmbeddingReg(nn.Module):
     def __init__(
         self,
         num_classes: int,
         embed_dim: int,
         temperature: float = 1.0,
-        reg_weights: dict = None,  
-        sim_matrix: torch.Tensor = None,    # [V, V]
+        reg_weights: Optional[dict] = None,
+        sim_matrix: Optional[torch.Tensor] = None,
+        stein_eps: float = 1e-4,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.embed_dim = embed_dim
-        self.temperature = temperature
+        self.temperature = float(temperature)
+        self.stein_eps = float(stein_eps)
 
         self.E = nn.Parameter(torch.randn(num_classes, embed_dim) * 0.02)
         self.W = nn.Parameter(torch.randn(num_classes, num_classes) * 0.02)
 
-        default = {"ent": 0.0, "lap": 0.0, "stein": 0.0}
+        weights = {"ent": 0.0, "lap": 0.0, "stein": 0.0}
         if reg_weights:
-            default.update(reg_weights)
-        self.reg_weights = default
+            weights.update(reg_weights)
+        self.reg_weights = weights
 
-        self.register_buffer("S", sim_matrix if sim_matrix is not None else torch.eye(num_classes))
+        S = sim_matrix if sim_matrix is not None else torch.eye(num_classes)
+        self.register_buffer("S", S)
 
     def forward(self, idx: torch.LongTensor):
-        T = F.softmax(self.W / self.temperature, dim=-1)  # [V, V]
-        p = T[idx]                                        # [B, V]
-        e = p @ self.E                                    # [B, D]
-        reg_loss = self._regularization(T)
+        Tmix = F.softmax(self.W / self.temperature, dim=-1)
+        p = Tmix[idx]
+        e = p @ self.E
+        reg_loss = self._regularization(Tmix)
         return e, reg_loss
 
-    def _regularization(self, T: torch.Tensor) -> torch.Tensor:
-        reg_loss = 0.0
+    def _regularization(self, Tmix: torch.Tensor) -> torch.Tensor:
+        reg = Tmix.new_zeros(())
         V = self.num_classes
 
-        # Entropy regularization
-        if self.reg_weights["ent"] > 0:
-            ent = (T * torch.log(T.clamp_min(1e-8))).sum(dim=-1).mean()
-            reg_loss += self.reg_weights["ent"] * ent
+        w_ent = self.reg_weights.get("ent", 0.0)
+        if w_ent != 0.0:
+            entropy = -(Tmix * torch.log(Tmix.clamp_min(1e-8))).sum(dim=-1).mean()
+            reg = reg + w_ent * entropy
 
-        # Graph Laplacian smoothing 
-        if self.reg_weights["lap"] > 0:
-            diff = self.E.unsqueeze(0) - self.E.unsqueeze(1)  # [V,V,D]
+        w_lap = self.reg_weights.get("lap", 0.0)
+        if w_lap != 0.0:
+            diff = self.E.unsqueeze(0) - self.E.unsqueeze(1)
             dist2 = (diff ** 2).sum(-1)
             lap = (self.S * dist2).sum() / (V * V)
-            reg_loss += self.reg_weights["lap"] * lap
+            reg = reg + w_lap * lap
 
-        # Stein smoothing 
-            E_norm = self.E - self.E.mean(0, keepdim=True)
-            cov = (E_norm.t() @ E_norm) / V
-            inv_cov = torch.linalg.inv(cov + 1e-4 * torch.eye(cov.size(0), device=cov.device))
-            score = -E_norm @ inv_cov
-            stein = -torch.mean(torch.sum(score * E_norm, dim=-1))
-            reg_loss += self.reg_weights["stein"] * stein
+        w_stein = self.reg_weights.get("stein", 0.0)
+        if w_stein != 0.0:
+            E0 = self.E - self.E.mean(0, keepdim=True)
+            cov = (E0.t() @ E0) / V
+            cov = cov + self.stein_eps * torch.eye(
+                cov.size(0), device=cov.device, dtype=cov.dtype
+            )
+            sol = torch.linalg.solve(cov, E0.t()).t()
+            score = -sol
+            stein = -torch.mean(torch.sum(score * E0, dim=-1))
+            reg = reg + w_stein * stein
 
-        return reg_loss
+        return reg
 
 
-# Continuous Features
 class FlowMatchingContinuousEncoder(nn.Module):
-    def __init__(self, input_dim, cond_dim=0, hidden_dim=128, n_layers=3, sigma=1.0):
+    def __init__(
+        self,
+        input_dim: int,
+        cond_dim: int = 0,
+        hidden_dim: int = 128,
+        n_layers: int = 3,
+        sigma: float = 1.0,
+    ):
         super().__init__()
-        self.sigma = sigma
+        self.sigma = float(sigma)
 
-        in_dim = input_dim + 1 + cond_dim  # + t
-        layers = []
+        in_dim = input_dim + 1 + cond_dim
+        layers: List[nn.Module] = []
         for i in range(n_layers):
-            layers += [
-                nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim),
-                nn.SiLU(),
-            ]
-        layers += [nn.Linear(hidden_dim, input_dim)]
+            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+            layers.append(nn.SiLU())
+        layers.append(nn.Linear(hidden_dim, input_dim))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x0: torch.Tensor, cond: Optional[torch.Tensor] = None):
-        B, D = x0.shape
+        B, _ = x0.shape
         device = x0.device
 
         x1 = torch.randn_like(x0) * self.sigma
-        t = torch.rand(B, 1, device=device)
+        t = torch.rand(B, 1, device=device, dtype=x0.dtype)
         x_t = (1 - t) * x0 + t * x1
         u_t = x1 - x0
 
-        inp = torch.cat([x_t, t, cond], dim=-1) if cond is not None else torch.cat([x_t, t], dim=-1)
+        if cond is not None:
+            inp = torch.cat([x_t, t, cond], dim=-1)
+        else:
+            inp = torch.cat([x_t, t], dim=-1)
+
         v_pred = self.net(inp)
         loss = F.mse_loss(v_pred, u_t)
         return loss, x_t, v_pred
 
     @torch.inference_mode()
-    def reverse_flow(self, x1: torch.Tensor, cond: Optional[torch.Tensor] = None, steps: int = 20):
+    def reverse_flow(
+        self,
+        x1: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+        steps: int = 20,
+    ):
         x = x1
-        t_vals = torch.linspace(1.0, 0.0, steps, device=x1.device)
+        t_vals = torch.linspace(1.0, 0.0, steps, device=x1.device, dtype=x1.dtype)
         dt = -1.0 / (steps - 1)
+
         for t in t_vals:
             t_batch = t.expand(x.size(0), 1)
-            inp = torch.cat([x, t_batch, cond], dim=-1) if cond is not None else torch.cat([x, t_batch], dim=-1)
+            if cond is not None:
+                inp = torch.cat([x, t_batch, cond], dim=-1)
+            else:
+                inp = torch.cat([x, t_batch], dim=-1)
             v = self.net(inp)
             x = x + dt * v
+
         return x
 
 
-# Tabular Encoder
 class TabularEncoder(nn.Module):
     def __init__(
         self,
         numeric_dim: int,
         categorical_cardinalities: List[int],
         cat_embed_dim: int = 16,
-        reg_weights: dict = None,
+        reg_weights: Optional[dict] = None,
         cond_mode: str = "concat",
     ):
         super().__init__()
         self.cond_mode = cond_mode
 
-        self.cat_embeddings = nn.ModuleList([
-            SoftCategoryEmbeddingReg(num_classes=c, embed_dim=cat_embed_dim, reg_weights=reg_weights)
-            for c in categorical_cardinalities
-        ])
+        self.cat_embeddings = nn.ModuleList(
+            [
+                SoftCategoryEmbeddingReg(
+                    num_classes=c, embed_dim=cat_embed_dim, reg_weights=reg_weights
+                )
+                for c in categorical_cardinalities
+            ]
+        )
+
         cond_dim = len(categorical_cardinalities) * cat_embed_dim if cond_mode == "concat" else 0
-        self.cont_encoder = FlowMatchingContinuousEncoder(input_dim=numeric_dim, cond_dim=cond_dim)
+        self.cont_encoder = FlowMatchingContinuousEncoder(
+            input_dim=numeric_dim, cond_dim=cond_dim
+        )
 
     def forward(self, numeric_tensor: torch.Tensor, categorical_idx: List[torch.Tensor]):
-        cat_vecs, reg_total = [], 0.0
+        cat_vecs: List[torch.Tensor] = []
+        reg_total = numeric_tensor.new_zeros(())
+
         for emb, idx in zip(self.cat_embeddings, categorical_idx):
             e, reg = emb(idx)
             cat_vecs.append(e)
-            reg_total += reg
+            reg_total = reg_total + reg
+
         cat_cond = torch.cat(cat_vecs, dim=-1) if len(cat_vecs) > 0 else None
 
-        fm_loss, x_t, _ = self.cont_encoder(numeric_tensor, cond=cat_cond if self.cond_mode == "concat" else None)
+        fm_loss, x_t, _ = self.cont_encoder(
+            numeric_tensor, cond=cat_cond if self.cond_mode == "concat" else None
+        )
+
         tab_embed = torch.cat([x_t, cat_cond], dim=-1) if cat_cond is not None else x_t
         total_loss = fm_loss + reg_total
         return tab_embed, total_loss
+
+
+class TemporalEncoderCMGRW_Flex(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 128,
+        n_layers: int = 2,
+        sigma_min: float = 0.05,
+        sigma_max: float = 0.5,
+        lambda_rec: float = 1.0,
+        model_type: str = "gru",
+        pooling: Literal["last", "mean"] = "last",
+        sigma_schedule: Literal["uniform", "log_uniform"] = "log_uniform",
+        consistency_mode: Literal["two_sample", "teacher_student"] = "two_sample",
+        teacher_on: Literal["f2", "f1"] = "f2",
+        detach_teacher: bool = True,
+        mlp_mult: int = 2,
+        fuse_f_theta: bool = True,
+        nhead: int = 4,
+        transformer_ff_mult: int = 2,
+        transformer_dropout: float = 0.1,
+        tcn_kernel_size: int = 3,
+        tcn_dropout: float = 0.1,
+        tcn_activation: Literal["relu", "silu", "gelu"] = "relu",
+        tcn_causal: bool = True,
+        downsample_stride: int = 1,
+        downsample_mode: Literal["avg", "conv"] = "avg",
+    ):
+        super().__init__()
+        self.sigma_min = float(sigma_min)
+        self.sigma_max = float(sigma_max)
+        self.lambda_rec = float(lambda_rec)
+        self.model_type = model_type.lower()
+        self.pooling = pooling
+        self.sigma_schedule = sigma_schedule
+        self.consistency_mode = consistency_mode
+        self.teacher_on = teacher_on
+        self.detach_teacher = detach_teacher
+        self.fuse_f_theta = fuse_f_theta
+        self.tcn_causal = tcn_causal
+
+        self.downsample_stride = int(downsample_stride)
+        self.downsample_mode = downsample_mode
+
+        if self.downsample_stride > 1:
+            if downsample_mode == "avg":
+                self.downsampler = nn.AvgPool1d(
+                    kernel_size=self.downsample_stride,
+                    stride=self.downsample_stride,
+                )
+            elif downsample_mode == "conv":
+                self.downsampler = nn.Conv1d(
+                    in_channels=input_dim,
+                    out_channels=input_dim,
+                    kernel_size=self.downsample_stride,
+                    stride=self.downsample_stride,
+                    padding=0,
+                    groups=1,
+                    bias=True,
+                )
+            else:
+                raise ValueError(f"Unsupported downsample_mode={downsample_mode}")
+        else:
+            self.downsampler = None
+
+        if self.model_type == "gru":
+            self.encoder = nn.GRU(
+                input_size=input_dim,
+                hidden_size=hidden_dim,
+                num_layers=n_layers,
+                batch_first=True,
+                bidirectional=False,
+            )
+            self.input_proj = None
+
+        elif self.model_type == "transformer":
+            self.input_proj = nn.Linear(input_dim, hidden_dim)
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=nhead,
+                dim_feedforward=hidden_dim * transformer_ff_mult,
+                batch_first=True,
+                dropout=transformer_dropout,
+                activation="gelu",
+            )
+            self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+
+        elif self.model_type == "tcn":
+            act_cls = {"relu": nn.ReLU, "silu": nn.SiLU, "gelu": nn.GELU}[tcn_activation]
+            layers: List[nn.Module] = []
+            in_ch = input_dim
+            self._tcn_total_pad = 0
+
+            for i in range(n_layers):
+                out_ch = hidden_dim
+                dilation = 2**i
+                pad = (tcn_kernel_size - 1) * dilation
+                self._tcn_total_pad = pad
+                layers.append(
+                    nn.Conv1d(
+                        in_ch,
+                        out_ch,
+                        tcn_kernel_size,
+                        dilation=dilation,
+                        padding=pad,
+                    )
+                )
+                layers.append(act_cls())
+                layers.append(nn.Dropout(tcn_dropout))
+                in_ch = out_ch
+
+            self.encoder = nn.Sequential(*layers)
+            self.input_proj = None
+
+        else:
+            raise ValueError(f"Unsupported model_type={model_type}")
+
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        self.f_theta = nn.Sequential(
+            nn.Linear(hidden_dim + 1, hidden_dim * mlp_mult),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * mlp_mult, hidden_dim),
+        )
+
+    def _maybe_downsample(self, x_seq: torch.Tensor) -> torch.Tensor:
+        if self.downsampler is None:
+            return x_seq
+        x = x_seq.transpose(1, 2)
+        x = self.downsampler(x)
+        x = x.transpose(1, 2)
+        return x
+
+    def _sample_sigma(self, B: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self.sigma_schedule == "uniform":
+            u = torch.rand(B, 1, device=device, dtype=dtype)
+            return u * (self.sigma_max - self.sigma_min) + self.sigma_min
+
+        if self.sigma_schedule == "log_uniform":
+            u = torch.rand(B, 1, device=device, dtype=dtype)
+            log_min = math.log(self.sigma_min)
+            log_max = math.log(self.sigma_max)
+            return torch.exp(log_min + u * (log_max - log_min))
+
+        raise ValueError(f"Unsupported sigma_schedule={self.sigma_schedule}")
+
+    def _encode_to_z0(self, x_seq: torch.Tensor) -> torch.Tensor:
+        if self.model_type == "gru":
+            z_enc, h_n = self.encoder(x_seq)
+            if self.pooling == "last":
+                z0 = h_n[-1]
+            elif self.pooling == "mean":
+                z0 = z_enc.mean(dim=1)
+            else:
+                raise ValueError(f"Unsupported pooling={self.pooling}")
+            return self.proj(z0)
+
+        if self.model_type == "transformer":
+            h = self.input_proj(x_seq)
+            z_enc = self.encoder(h)
+            z0 = z_enc.mean(dim=1)
+            return self.proj(z0)
+
+        h = x_seq.transpose(1, 2)
+        z = self.encoder(h)
+
+        if self.tcn_causal:
+            L = x_seq.size(1)
+            z = z[..., -L:]
+
+        z0 = z.transpose(1, 2).mean(dim=1)
+        return self.proj(z0)
+
+    def _f_theta_batched(
+        self,
+        zt1: torch.Tensor,
+        s1: torch.Tensor,
+        zt2: torch.Tensor,
+        s2: torch.Tensor,
+    ):
+        if self.fuse_f_theta:
+            zt = torch.cat([zt1, zt2], dim=0)
+            s = torch.cat([s1, s2], dim=0)
+            f = self.f_theta(torch.cat([zt, s], dim=-1))
+            f1, f2 = f.chunk(2, dim=0)
+            return f1, f2
+
+        f1 = self.f_theta(torch.cat([zt1, s1], dim=-1))
+        f2 = self.f_theta(torch.cat([zt2, s2], dim=-1))
+        return f1, f2
+
+    def forward(self, x_seq: torch.Tensor):
+        x_seq = self._maybe_downsample(x_seq)
+
+        B = x_seq.size(0)
+        device = x_seq.device
+        dtype = x_seq.dtype
+
+        z0 = self._encode_to_z0(x_seq)
+
+        eps1 = torch.randn_like(z0)
+        eps2 = torch.randn_like(z0)
+        sigma_t1 = self._sample_sigma(B, device, dtype)
+        sigma_t2 = self._sample_sigma(B, device, dtype)
+
+        zt1 = z0 + sigma_t1 * eps1
+        zt2 = z0 + sigma_t2 * eps2
+
+        f1, f2 = self._f_theta_batched(zt1, sigma_t1, zt2, sigma_t2)
+
+        if self.consistency_mode == "two_sample":
+            loss_cons = F.mse_loss(f1, f2) + self.lambda_rec * F.mse_loss(f1, z0)
+        elif self.consistency_mode == "teacher_student":
+            if self.teacher_on == "f2":
+                teacher = f2.detach() if self.detach_teacher else f2
+                student = f1
+            elif self.teacher_on == "f1":
+                teacher = f1.detach() if self.detach_teacher else f1
+                student = f2
+            else:
+                raise ValueError(f"Unsupported teacher_on={self.teacher_on}")
+
+            loss_cons = F.mse_loss(student, teacher) + self.lambda_rec * F.mse_loss(student, z0)
+        else:
+            raise ValueError(f"Unsupported consistency_mode={self.consistency_mode}")
+
+        return z0, loss_cons
+
+    @torch.inference_mode()
+    def geodesic_random_walk(self, z0: torch.Tensor, steps: int = 5, step_size: float = 0.1):
+        z = z0
+        traj = [z]
+        for _ in range(steps):
+            noise = torch.randn_like(z)
+            noise = noise / noise.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            z = z + step_size * noise
+            traj.append(z)
+        return torch.stack(traj, dim=1)
 
 
 # Text Encoder
@@ -225,100 +585,6 @@ class ImageEncoderDenseNetCheXpert(nn.Module):
             feats = F.relu(feats, inplace=True)
             feats = self.pool(feats).reshape(x.size(0), -1)
         return feats
-
-
-# Temporal Encoder
-class TemporalEncoderCMGRW_Flex(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 128,
-        n_layers: int = 2,
-        sigma_min: float = 0.05,
-        sigma_max: float = 0.5,
-        lambda_rec: float = 1.0,
-        model_type: str = "gru",
-        tcn_kernel_size: int = 3,
-        tcn_dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.lambda_rec = lambda_rec
-        self.model_type = model_type.lower()
-
-        if self.model_type == "gru":
-            self.encoder = nn.GRU(input_size=input_dim, hidden_size=hidden_dim, num_layers=n_layers,
-                                  batch_first=True, bidirectional=False)
-
-        elif self.model_type == "transformer":
-            self.input_proj = nn.Linear(input_dim, hidden_dim)
-            enc_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4,
-                                                   dim_feedforward=hidden_dim * 2, batch_first=True,
-                                                   dropout=0.1, activation="gelu")
-            self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-
-        elif self.model_type == "tcn":
-            layers = []
-            in_ch = input_dim
-            for i in range(n_layers):
-                out_ch = hidden_dim
-                dilation = 2 ** i
-                layers += [
-                    nn.Conv1d(in_ch, out_ch, tcn_kernel_size, dilation=dilation,
-                              padding=(tcn_kernel_size - 1) * dilation),
-                    nn.ReLU(),
-                    nn.Dropout(tcn_dropout),
-                ]
-                in_ch = out_ch
-            self.encoder = nn.Sequential(*layers)
-        else:
-            raise ValueError(f"Unsupported model_type={model_type}")
-
-        self.proj = nn.Linear(hidden_dim, hidden_dim)
-        self.f_theta = nn.Sequential(
-            nn.Linear(hidden_dim + 1, hidden_dim * 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-        )
-
-    def forward(self, x_seq: torch.Tensor):
-        B = x_seq.size(0)
-        device = x_seq.device
-
-        if self.model_type == "gru":
-            z_enc, _ = self.encoder(x_seq)          # [B,L,H]
-            z0 = self.proj(z_enc.mean(1))           # [B,H]
-        elif self.model_type == "transformer":
-            h = self.input_proj(x_seq)              # [B,L,H]
-            z_enc = self.encoder(h)
-            z0 = self.proj(z_enc.mean(1))
-        elif self.model_type == "tcn":
-            h = x_seq.permute(0, 2, 1)              # [B,D,L]
-            z_enc = self.encoder(h)                  # [B,H,L]
-            z0 = self.proj(z_enc.permute(0, 2, 1).mean(1))
-
-        # Consistency regularization
-        eps1, eps2 = torch.randn_like(z0), torch.randn_like(z0)
-        sigma_t1 = torch.rand(B, 1, device=device) * (self.sigma_max - self.sigma_min) + self.sigma_min
-        sigma_t2 = torch.rand(B, 1, device=device) * (self.sigma_max - self.sigma_min) + self.sigma_min
-        zt1, zt2 = z0 + sigma_t1 * eps1, z0 + sigma_t2 * eps2
-        f1 = self.f_theta(torch.cat([zt1, sigma_t1], -1))
-        f2 = self.f_theta(torch.cat([zt2, sigma_t2], -1))
-        loss_cons = F.mse_loss(f1, f2) + self.lambda_rec * F.mse_loss(f1, z0)
-
-        return z0, loss_cons
-
-    @torch.inference_mode()
-    def geodesic_random_walk(self, z0: torch.Tensor, steps: int = 5, step_size: float = 0.1):
-        z = z0
-        traj = [z]
-        for _ in range(steps):
-            noise = torch.randn_like(z)
-            noise = noise / noise.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            z = z + step_size * noise
-            traj.append(z)
-        return torch.stack(traj, dim=1)  # [B, steps+1, H]
 
 
 class MultiModalPreprocessor:
