@@ -24,49 +24,49 @@ MISSING_TOKEN = "__MISSING__"
 
 TABLES: List[str] = [
     "demographics",
-    "admissions",
+    # "admissions",
     "icustays",
     "transfers",
     "prescriptions",
-    "procedures_icd",
+    # "procedures_icd",
 ]
 
 TIME_COL: Dict[str, Optional[str]] = {
     "demographics": None,
-    "admissions": "admittime",
+    # "admissions": "admittime",
     "icustays": "intime",
     "transfers": "intime",
     "prescriptions": "starttime",
-    "procedures_icd": "chartdate",
+    # "procedures_icd": "chartdate",
 }
 
 CAT_COLS: List[str] = [
     "gender",
     "anchor_year_group",
-    "admission_type",
-    "admission_location",
-    "insurance",
-    "language",
-    "marital_status",
+    # "admission_type",
+    # "admission_location",
+    # "insurance",
+    # "language",
+    # "marital_status",
     "first_careunit",
     "last_transfer_eventtype",
     "last_transfer_careunit",
     "top_drug_type",
     "top_route",
-    "top_drug",
-    "top_icd_code",
+    # "top_drug",
+    # "top_icd_code",
 ]
 
 NUM_COLS: List[str] = [
     "anchor_age",
-    "hadm_count",
+    # "hadm_count",
     "icustay_count",
     "transfer_count",
     "presc_count",
     "presc_unique_drug",
-    "proc_count",
-    "proc_unique_icd",
-    "icu_los_hours",
+    # "proc_count",
+    # "proc_unique_icd",
+    # "icu_los_hours",
 ]
 
 
@@ -298,11 +298,11 @@ def agg_procedures(df: pd.DataFrame) -> pd.DataFrame:
 
 AGG_FN = {
     "demographics": agg_demographics,
-    "admissions": agg_admissions,
+    # "admissions": agg_admissions,
     "icustays": agg_icustays,
     "transfers": agg_transfers,
     "prescriptions": agg_prescriptions,
-    "procedures_icd": agg_procedures,
+    # "procedures_icd": agg_procedures,
 }
 
 
@@ -388,10 +388,10 @@ def make_sample_level_bucket(bucket: int) -> Optional[pd.DataFrame]:
     if bucket_df is None or len(bucket_df) == 0:
         return None
 
-    if "hadm_id" in bucket_df.columns:
-        bucket_df["hadm_count"] = bucket_df["hadm_id"].notna().astype(np.float32)
-    else:
-        bucket_df["hadm_count"] = 0.0
+    # if "hadm_id" in bucket_df.columns:
+    #     bucket_df["hadm_count"] = bucket_df["hadm_id"].notna().astype(np.float32)
+    # else:
+    #     bucket_df["hadm_count"] = 0.0
 
     for c in NUM_COLS:
         if c not in bucket_df.columns:
