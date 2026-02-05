@@ -167,7 +167,7 @@
 import torch
 import random
 from trl import GRPOConfig
-from lazydecoderonly import (
+from generative_rec.lazydecoderonly import (
     LazyDecoder,
     LazyDecoderConfig,
     LazyDecoderForCausalLM,

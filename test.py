@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 from minitrainer import MiniTrainer
-from lazydecoderonly import LazyDecoder
+from generative_rec.lazydecoderonly import LazyDecoder
 import torch.nn.functional as F
 from torch import optim
 

@@ -97,12 +97,6 @@ def _merge_heads(x):
 
 
 def scaled_dot_product_attention(q,k,v,attn_mask,dropout_p=0.0,training=True):
-    """基础 SDPA
-      q: (B, T_q, H_q, d)
-      k: (B, T_k, H_k, d)
-      v: (B, T_k, H_k, d)
-      attn_mask: (B, 1, T_q, T_k) or (1, 1, T_q, T_k)，-inf 位置被屏蔽
-    """
     d = q.size(-1)
     # (B, H_q, T_q, d) @ (B, H_k, d, T_k) → (B, H_q, T_q, T_k)
     q_ = q.permute(0, 2, 1, 3)
@@ -110,7 +104,7 @@ def scaled_dot_product_attention(q,k,v,attn_mask,dropout_p=0.0,training=True):
     attn_scores = torch.matmul(q_, k_) / math.sqrt(d)
 
     if attn_mask is not None:
-        attn_scores = attn_scores + attn_mask  # 预期 mask 已为 -inf/0 形式
+        attn_scores = attn_scores + attn_mask  
 
     attn_probs = F.softmax(attn_scores, dim=-1)
     if dropout_p > 0 and training:
@@ -125,7 +119,6 @@ def scaled_dot_product_attention(q,k,v,attn_mask,dropout_p=0.0,training=True):
 
 
 class MultiHeadSelfAttention(nn.Module):
-    """标准多头自注意力（支持可选的 causal mask）。"""
     def __init__(self, d_model, n_heads, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         assert d_model % n_heads == 0
@@ -152,7 +145,6 @@ class MultiHeadSelfAttention(nn.Module):
         # causal mask: (1, 1, T, T)
         attn_mask = None
         if causal:
-            # 下三角为0，上三角为 -inf
             mask = torch.full((T, T), float('-inf'), device=x.device)
             mask = torch.triu(mask, diagonal=1)
             attn_mask = mask.unsqueeze(0).unsqueeze(0)  # (1,1,T,T)
@@ -169,7 +161,7 @@ class MultiHeadSelfAttention(nn.Module):
 class LazyCrossAttentionGQA(nn.Module):
     def __init__(self, d_model, n_heads_q, gkv, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
-        assert n_heads_q % gkv == 0 # n_heads_q 必须能被 Gkv 整除（每组共享一份 K/V）
+        assert n_heads_q % gkv == 0 
         self.d_model = d_model
         self.n_heads_q = n_heads_q
         self.gkv = gkv
@@ -190,7 +182,6 @@ class LazyCrossAttentionGQA(nn.Module):
         q = self.q_proj(self.norm_q(x_q))  # (B, Tq, D)
         q = _split_heads(q, self.n_heads_q)  # (B, Tq, Hq, d)
 
-        # 将 (B, Tk, Gkv, d) 映射为 (B, Tk, Hq, d)，通过 repeat_interleave
         repeat = self.n_heads_q // self.gkv
         k = k_ctx.repeat_interleave(repeat, dim=2)
         v = v_ctx.repeat_interleave(repeat, dim=2)
@@ -291,7 +282,6 @@ class ContextProcessor(nn.Module):
         self.skv = skv
         self.d_context = skv * lkv * gkv * d_head
 
-        # 三路线性映射到相同维度后拼接（也可换成各自独立映射 + concat + 再线性）
         self.proj = nn.Linear(d_in, self.d_context, bias=False)
         self.norm_k_layers = nn.ModuleList([RMSNorm(gkv * d_head) if use_norm_k else nn.Identity()
                                             for _ in range(lkv)])
@@ -304,30 +294,25 @@ class ContextProcessor(nn.Module):
             if x is not None:
                 # x: (B, T, D_in) → (B, T, d_context)
                 ctx_parts.append(self.proj(x))
-        assert len(ctx_parts) > 0 # 至少需要一条上下文输入
-        # 沿时间维拼接： (B, T_ctx, d_context)
+        assert len(ctx_parts) > 0 
         ctx = torch.cat(ctx_parts, dim=1) if len(ctx_parts) > 1 else ctx_parts[0]
 
         B, Tctx, D = ctx.shape
         assert D == self.d_context
 
-        # 切块：Lkv 份，每份大小 = skv * gkv * d_head
         chunk_size = self.skv * self.gkv * self.d_head
-        chunks = ctx.split(chunk_size, dim=-1)  # 长度应为 Lkv
+        chunks = ctx.split(chunk_size, dim=-1) 
         assert len(chunks) == self.lkv, f"期望 {self.lkv} 份，得到 {len(chunks)}"
 
         kv_list = []
         for l, ch in enumerate(chunks):
             # ch: (B, Tctx, skv*gkv*d_head)
             if self.skv == 1:
-                # 共享：v_l = k_l
                 k = ch  # (B, Tctx, gkv*d_head)
                 k = self.norm_k_layers[l](k)
-                # reshape 到 (B,T,Gkv,d_head)
                 k = k.view(B, Tctx, self.gkv, self.d_head)
                 v = k
             else:
-                # 独立：前半为 K，后半为 V
                 mid = (self.gkv * self.d_head)
                 k, v = ch[..., :mid], ch[..., mid:]
                 k = self.norm_k_layers[l](k)
@@ -338,17 +323,12 @@ class ContextProcessor(nn.Module):
         return kv_list
 
 def compute_sft_loss(logits, labels, pad_id, bos_id):
-    """
-    - 只对 semantic tokens 计算
-    - BOS / PAD 不算
-    """
     B, T, V = logits.shape
 
     # shift for causal LM
     logits = logits[:, :-1]      # (B, T-1, V)
     labels = labels[:, 1:]       # (B, T-1)
 
-    # 显式 mask：PAD + BOS 都不算
     loss_mask = (labels != pad_id) & (labels != bos_id)
 
     # token-level CE
@@ -891,7 +871,6 @@ class GBPOTrainer:
             std = rewards.std(unbiased=False)
             return (rewards - mean) / (std + eps)
 
-        # 存在 group_ids 时，按 group 分别归一化
         A = torch.zeros_like(rewards)
         unique_groups = torch.unique(group_ids)
         for g in unique_groups:
@@ -965,7 +944,7 @@ class GBPOTrainer:
     #     new_logits: torch.Tensor,      # (B, T, V)
     #     old_logits: torch.Tensor,      # (B, T, V)
     #     target_ids: torch.Tensor,      # (B, T)
-    #     rewards: torch.Tensor,         # 推荐 (B,)，也支持 (B, T)
+    #     rewards: torch.Tensor,         # (B,)， (B, T)
     #     group_ids: Optional[torch.Tensor] = None,
     # ) -> torch.Tensor:
     #     mask = self._sequence_mask(target_ids)  # (B, T)
@@ -1093,7 +1072,6 @@ class GBPOTrainer:
 
             lp = [self.semantic_processor] if self.semantic_processor is not None else None
 
-            # 1) rollout：只在这里 no_grad
             with torch.no_grad():
                 gen_ids, logp_new, _ = self.model.generate_with_logprobs(
                     input_ids=start_ids,
@@ -1117,13 +1095,11 @@ class GBPOTrainer:
                     logits_processor=lp,
                 )
 
-            # 2) 准备 reward / group
             rewards = batch["rewards"].to(self.device)
             group_ids = batch.get("group_ids", None)
             if group_ids is not None:
                 group_ids = group_ids.to(self.device)
 
-            # 3) 对齐 mask 长度（避免 eos 提前截断造成错位）
             logp_new = logp_new.detach()
             logp_old = logp_old.detach()
 
@@ -1131,7 +1107,6 @@ class GBPOTrainer:
             action_ids = gen_ids[:, 1:1+T]               # (B, T)
             mask = self._sequence_mask(action_ids)       # (B, T)
 
-            # 4) rollout-logprob 版 GBPO
             loss_gbpo = self.compute_gbpo_loss_from_logprob(
                 logp_new=logp_new,
                 logp_old=logp_old,

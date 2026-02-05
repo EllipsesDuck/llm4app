@@ -24,7 +24,7 @@ import random
 from datasets import Dataset as HFDataset
 from torch.utils.data import ConcatDataset
 
-from lazydecoderonly import LazyDecoder
+from generative_rec.lazydecoderonly import LazyDecoder
 from minitrainer import MiniTrainer
 from llmtrainer import LLMTrainer,TokenExtender
 
