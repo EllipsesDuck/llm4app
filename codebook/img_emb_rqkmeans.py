@@ -9,7 +9,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-# Utils
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(x, **kwargs):
+        return x
+
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -46,24 +52,49 @@ def load_sample_index(path: str) -> Dict[str, List[int]]:
     return sid2lab
 
 
+def normalize_sids(arr) -> List[str]:
+    arr = np.asarray(arr)
+    out = []
+    for x in arr:
+        if isinstance(x, (bytes, np.bytes_)):
+            out.append(x.decode("utf-8", errors="ignore").strip())
+        else:
+            out.append(str(x).strip())
+    return out
+
+
 def parse_meta_dtype(dtype_raw):
+    # unwrap ndarray
     if isinstance(dtype_raw, np.ndarray):
         if dtype_raw.size == 0:
             raise ValueError("Empty dtype array in meta")
         dtype_raw = dtype_raw.item() if dtype_raw.size == 1 else dtype_raw.reshape(-1)[0].item()
 
+    # bytes -> str
     if isinstance(dtype_raw, (bytes, np.bytes_)):
         dtype_raw = dtype_raw.decode("utf-8", errors="ignore")
 
+    # already dtype
+    if isinstance(dtype_raw, np.dtype):
+        return dtype_raw
+
+    # numpy scalar type (np.float16 etc.)
+    if isinstance(dtype_raw, type) and issubclass(dtype_raw, np.generic):
+        return np.dtype(dtype_raw)
+
+    s = str(dtype_raw).lower().strip()
+    if "float16" in s:
+        return np.dtype(np.float16)
+    if "float32" in s:
+        return np.dtype(np.float32)
+    if "float64" in s:
+        return np.dtype(np.float64)
+
+    # fallback
     try:
         return np.dtype(dtype_raw)
-    except TypeError:
-        s = str(dtype_raw)
-        if "float16" in s:
-            return np.dtype(np.float16)
-        if "float32" in s:
-            return np.dtype(np.float32)
-        raise
+    except Exception as e:
+        raise TypeError(f"Cannot parse dtype from meta: {dtype_raw}") from e
 
 
 def open_emb_memmap(emb_path: str):
@@ -76,15 +107,8 @@ def open_emb_memmap(emb_path: str):
     emb_dim = int(np.asarray(meta["emb_dim"]).item())
     dtype = parse_meta_dtype(meta["dtype"])
 
-    emb = np.memmap(
-        emb_path,
-        dtype=dtype,
-        mode="r",
-        shape=(count, emb_dim)
-    )
-
-    meta_dict = {"count": count, "emb_dim": emb_dim, "dtype": dtype}
-    return emb, meta_dict
+    emb = np.memmap(emb_path, dtype=dtype, mode="r", shape=(count, emb_dim))
+    return emb, {"count": count, "emb_dim": emb_dim, "dtype": dtype}
 
 
 def list_bucket_files(emb_dir: str, tag: str = "") -> List[Tuple[str, str, int]]:
@@ -105,8 +129,10 @@ def list_bucket_files(emb_dir: str, tag: str = "") -> List[Tuple[str, str, int]]
             continue
 
         sp = ep.replace("_emb.npy", "_sid.npy")
-        if not os.path.exists(sp):
-            raise ValueError(f"Missing sid file for {ep}: expected {sp}")
+        mp = ep.replace("_emb.npy", "_meta.npz")
+        if not (os.path.exists(sp) and os.path.exists(mp)):
+            raise FileNotFoundError(f"Missing sid/meta for {ep}: sid={sp} meta={mp}")
+
         pairs.append((ep, sp, b))
 
     pairs = sorted(pairs, key=lambda x: x[2])
@@ -134,7 +160,7 @@ class BucketedEmbDataset(Dataset):
             self.bucket_id_per_bucket.append(bucket_id)
 
             for ri in range(len(sids)):
-                sid = str(sids[ri])
+                sid = str(sids[ri]).strip()
                 if self.require_label and sid not in sid2lab:
                     continue
                 self.index.append((bi, ri))
@@ -149,37 +175,28 @@ class BucketedEmbDataset(Dataset):
 
     def __getitem__(self, i: int):
         bi, ri = self.index[i]
-        x = self.emb_mmaps[bi][ri]
-        sid = str(self.sids_per_bucket[bi][ri])
+        sid = str(self.sids_per_bucket[bi][ri]).strip()
+
+        x = self.emb_mmaps[bi][ri]                       # memmap slice
+        x = np.asarray(x, dtype=np.float32).copy()       
+        if not np.isfinite(x).all():
+            bad = np.where(~np.isfinite(x))[0][:10]
+            raise ValueError(
+                f"[BAD X] sid={sid} bi={bi} ri={ri} "
+                f"non-finite dims={bad} min={np.nanmin(x)} max={np.nanmax(x)}"
+            )
+
         lab = self.sid2lab.get(sid, None)
-        x = torch.from_numpy(np.asarray(x, dtype=np.float32))
+        x = torch.from_numpy(x)
         return x, sid, lab
 
 
-# RQ-KMeans (Residual KMeans Quantization)
 def _cdist_squared(x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     # x: (B,D), c: (K,D) -> dist2: (B,K)
-    # dist2 = ||x||^2 + ||c||^2 - 2 x c^T
-    x2 = (x * x).sum(dim=1, keepdim=True)           # (B,1)
-    c2 = (c * c).sum(dim=1, keepdim=True).T         # (1,K)
-    xc = x @ c.T                                     # (B,K)
+    x2 = (x * x).sum(dim=1, keepdim=True)          # (B,1)
+    c2 = (c * c).sum(dim=1, keepdim=True).T        # (1,K)
+    xc = x @ c.T                                   # (B,K)
     return x2 + c2 - 2.0 * xc
-
-
-@torch.no_grad()
-def _init_centroids_from_loader(dl: DataLoader, k: int, device: str, max_batches: int = 10) -> torch.Tensor:
-    buf = []
-    for bi, (x, _, _) in enumerate(dl):
-        buf.append(x)
-        if bi + 1 >= max_batches:
-            break
-    x0 = torch.cat(buf, dim=0)
-    if x0.size(0) < k:
-        rep = (k + x0.size(0) - 1) // x0.size(0)
-        x0 = x0.repeat(rep, 1)
-    perm = torch.randperm(x0.size(0))[:k]
-    c = x0[perm].to(device)
-    return c.contiguous()
 
 
 class RQKMeans(torch.nn.Module):
@@ -208,16 +225,16 @@ class RQKMeans(torch.nn.Module):
 
     @torch.no_grad()
     def init_from_loader(self, dl: DataLoader, device: str, init_batches: int = 10):
-        r_dl_cache = None  
         buf = []
         for bi, (x, _, _) in enumerate(dl):
-            buf_confirm = x
-            buf.append(buf_confirm)
+            buf.append(x)
             if bi + 1 >= init_batches:
                 break
+
         x0 = torch.cat(buf, dim=0).to(device)
-        if x0.size(0) < max(self.num_emb_list):
-            rep = (max(self.num_emb_list) + x0.size(0) - 1) // x0.size(0)
+        need = max(self.num_emb_list)
+        if x0.size(0) < need:
+            rep = (need + x0.size(0) - 1) // x0.size(0)
             x0 = x0.repeat(rep, 1)
 
         r = x0
@@ -225,9 +242,10 @@ class RQKMeans(torch.nn.Module):
             perm = torch.randperm(r.size(0), device=device)[:k]
             c = r[perm].contiguous()
             self.codebooks[li].data.copy_(c)
-            # reset ema stats
+
             self.ema_counts[li].data.zero_()
             self.ema_sums[li].data.zero_()
+
             dist2 = _cdist_squared(r, self.codebooks[li].data)
             idx = dist2.argmin(dim=1)
             q = self.codebooks[li].data[idx]
@@ -237,31 +255,16 @@ class RQKMeans(torch.nn.Module):
 
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        # returns indices: (B, n_layers)
         r = x
         idxs = []
         for li in range(self.n_layers):
             c = self.codebooks[li].data
             dist2 = _cdist_squared(r, c)
-            idx = dist2.argmin(dim=1)  # (B,)
+            idx = dist2.argmin(dim=1)
             q = c[idx]
             r = r - q
             idxs.append(idx)
-        return torch.stack(idxs, dim=1)
-
-    @torch.no_grad()
-    def quantize(self, x: torch.Tensor) -> torch.Tensor:
-        # returns recon: (B,D)
-        r = x
-        recon = torch.zeros_like(x)
-        for li in range(self.n_layers):
-            c = self.codebooks[li].data
-            dist2 = _cdist_squared(r, c)
-            idx = dist2.argmin(dim=1)
-            q = c[idx]
-            recon = recon + q
-            r = r - q
-        return recon
+        return torch.stack(idxs, dim=1)  # (B, n_layers)
 
     @torch.no_grad()
     def update_layer_minibatch(self, r: torch.Tensor, layer_idx: int):
@@ -273,15 +276,14 @@ class RQKMeans(torch.nn.Module):
         onehot = torch.zeros(r.size(0), k, device=r.device, dtype=r.dtype)
         onehot.scatter_(1, idx.view(-1, 1), 1.0)
 
-        batch_counts = onehot.sum(dim=0)                       # (K,)
-        batch_sums = onehot.T @ r                               # (K,D)
+        batch_counts = onehot.sum(dim=0)      # (K,)
+        batch_sums = onehot.T @ r             # (K,D)
 
-        # EMA
         decay = self.ema_decay
         self.ema_counts[layer_idx].data.mul_(decay).add_(batch_counts * (1.0 - decay))
         self.ema_sums[layer_idx].data.mul_(decay).add_(batch_sums * (1.0 - decay))
 
-        denom = self.ema_counts[layer_idx].data.clamp_min(self.eps).unsqueeze(1)  # (K,1)
+        denom = self.ema_counts[layer_idx].data.clamp_min(self.eps).unsqueeze(1)
         new_c = self.ema_sums[layer_idx].data / denom
         self.codebooks[layer_idx].data.copy_(new_c)
 
@@ -291,26 +293,18 @@ class RQKMeans(torch.nn.Module):
 
 
 @torch.no_grad()
-def train_rqkmeans(
-    model: RQKMeans,
-    dl: DataLoader,
-    device: str,
-    epochs: int,
-    log_every: int = 100,
-):
+def train_rqkmeans(model: RQKMeans, dl: DataLoader, device: str, epochs: int, log_every: int = 100):
     assert int(model._inited.item()) == 1, "Call model.init_from_loader(...) first!"
+    model.eval()
 
-    model.eval() 
-    step = 0
     for ep in range(1, epochs + 1):
         avg_res2 = 0.0
         n_seen = 0
 
         for bi, (x, _, _) in enumerate(dl):
-            step += 1
             x = x.to(device, non_blocking=True)
-            r = x
 
+            r = x
             for li in range(model.n_layers):
                 r, _ = model.update_layer_minibatch(r, li)
 
@@ -326,7 +320,17 @@ def train_rqkmeans(
 
 
 @torch.no_grad()
-def export_codes_by_bucket_rqkmeans(model, bucket_pairs, out_dir_codes, device, batch_size: int, tag: str):
+def export_codes_by_bucket_rqkmeans(
+    model: RQKMeans,
+    bucket_pairs,
+    out_dir_codes: str,
+    device: str,
+    batch_size: int,
+    tag: str,
+    ref_bucket_dir: Optional[str] = None,
+    ref_sid_name: str = "sample_id.npy",
+    save_aligned_sid: bool = True,
+):
     os.makedirs(out_dir_codes, exist_ok=True)
     model.eval()
 
@@ -334,12 +338,20 @@ def export_codes_by_bucket_rqkmeans(model, bucket_pairs, out_dir_codes, device, 
     tag_suffix = f"_{tag}" if tag else ""
 
     for emb_path, sid_path, b in bucket_pairs:
+        # current sids for this emb bucket
+        cur_sids = normalize_sids(np.load(sid_path, allow_pickle=True))
+
         emb, _ = open_emb_memmap(emb_path)
         n, d = emb.shape
-        codes_list = []
+        assert n == len(cur_sids), f"Mismatch rows: {emb_path} ({n}) vs {sid_path} ({len(cur_sids)})"
 
+        # compute codes in current order
+        codes_list = []
         for s in range(0, n, batch_size):
-            x = np.asarray(emb[s:s + batch_size], dtype=np.float32)
+            x = np.asarray(emb[s:s + batch_size], dtype=np.float32).copy()
+            if not np.isfinite(x).all():
+                raise ValueError(f"[BAD X export] bucket={b:03d} slice={s}:{s+batch_size} has non-finite")
+
             x = torch.from_numpy(x).to(device)
             idx = model.encode(x)  # (B, n_layers)
             codes_list.append(idx.detach().cpu().numpy().astype(np.int32))
@@ -347,9 +359,49 @@ def export_codes_by_bucket_rqkmeans(model, bucket_pairs, out_dir_codes, device, 
         codes = np.concatenate(codes_list, axis=0)
         assert codes.shape[0] == n
 
-        out_codes = os.path.join(out_dir_codes, f"bucket_{b:03d}{tag_suffix}_codes.npy")
-        np.save(out_codes, codes)
-        print(f"[Export] bucket {b:03d}: codes {codes.shape} -> {out_codes}")
+        out_sids = cur_sids
+        out_codes = codes
+
+        # optional: align to reference bucket sid order
+        if ref_bucket_dir is not None and ref_bucket_dir.strip():
+            ref_sid_path = os.path.join(ref_bucket_dir, f"bucket_{b:03d}", ref_sid_name)
+            if not os.path.exists(ref_sid_path):
+                raise FileNotFoundError(f"[ref] missing: {ref_sid_path}")
+
+            ref_sids = normalize_sids(np.load(ref_sid_path, allow_pickle=True))
+
+            cur_pos = {sid: i for i, sid in enumerate(cur_sids)}
+            aligned_codes = []
+            kept_sids = []
+            missing = 0
+
+            for sid in ref_sids:
+                j = cur_pos.get(sid, None)
+                if j is None:
+                    missing += 1
+                    continue
+                aligned_codes.append(codes[j])
+                kept_sids.append(sid)
+
+            aligned_codes = np.asarray(aligned_codes, dtype=np.int32)
+            extras = len(set(cur_sids) - set(ref_sids))
+
+            if missing > 0:
+                print(f"[WARN] bucket {b:03d}: {missing} ref_sids not found in current emb bucket (dropped).")
+            if extras > 0:
+                print(f"[INFO] bucket {b:03d}: current has {extras} extra sids not in ref (dropped).")
+
+            out_codes = aligned_codes
+            out_sids = kept_sids if save_aligned_sid else out_sids
+
+        out_codes_path = os.path.join(out_dir_codes, f"bucket_{b:03d}{tag_suffix}_codes.npy")
+        np.save(out_codes_path, out_codes)
+
+        if save_aligned_sid:
+            out_sid_path = os.path.join(out_dir_codes, f"bucket_{b:03d}{tag_suffix}_sample_id.npy")
+            np.save(out_sid_path, np.asarray(out_sids, dtype=object))
+
+        print(f"[Export] bucket {b:03d}: codes {out_codes.shape} -> {out_codes_path}")
 
 
 def main():
@@ -368,11 +420,14 @@ def main():
     ap.add_argument("--ema_decay", default=0.9, type=float, help="EMA decay for online kmeans update, 0.9~0.99")
     ap.add_argument("--init_batches", default=10, type=int, help="how many batches used for init sampling")
     ap.add_argument("--log_every", default=100, type=int)
-
     ap.add_argument("--require_label", action="store_true")
     ap.add_argument("--seed", default=42, type=int)
 
     ap.add_argument("--export_batch_size", default=4096, type=int)
+
+    ap.add_argument("--ref_bucket_dir", default="", type=str,
+                    help="(optional) ref dir containing bucket_XXX/sample_id.npy order, e.g. tab_embed_v1_mlp")
+    ap.add_argument("--ref_sid_name", default="sample_id.npy", type=str)
 
     args = ap.parse_args()
     set_seed(args.seed)
@@ -401,28 +456,15 @@ def main():
     num_emb_list = [int(x) for x in args.num_emb_list.split(",") if x.strip()]
     assert len(num_emb_list) >= 1, "num_emb_list must have at least 1 layer"
 
-    model = RQKMeans(
-        in_dim=ds.in_dim,
-        num_emb_list=num_emb_list,
-        ema_decay=args.ema_decay,
-    ).to(device)
+    model = RQKMeans(in_dim=ds.in_dim, num_emb_list=num_emb_list, ema_decay=args.ema_decay).to(device)
 
-    # init
     print("[Info] init codebooks from data ...")
     model.init_from_loader(dl, device=device, init_batches=args.init_batches)
     print("[Info] init done.")
 
-    # train
     print("[Info] training RQ-KMeans ...")
-    train_rqkmeans(
-        model=model,
-        dl=dl,
-        device=device,
-        epochs=args.epochs,
-        log_every=args.log_every,
-    )
+    train_rqkmeans(model=model, dl=dl, device=device, epochs=args.epochs, log_every=args.log_every)
 
-    # save
     os.makedirs(args.out_dir, exist_ok=True)
     ckpt_path = os.path.join(args.out_dir, "rqkmeans_ckpt.pt")
     torch.save(
@@ -436,7 +478,6 @@ def main():
     )
     print(f"[Info] saved ckpt: {ckpt_path}")
 
-    # export codes
     out_codes_dir = os.path.join(args.out_dir, "codes_bucketed")
     export_codes_by_bucket_rqkmeans(
         model=model,
@@ -445,6 +486,9 @@ def main():
         device=device,
         batch_size=args.export_batch_size,
         tag=args.tag,
+        ref_bucket_dir=(args.ref_bucket_dir if args.ref_bucket_dir.strip() else None),
+        ref_sid_name=args.ref_sid_name,
+        save_aligned_sid=True,
     )
     print("[Done] exported codes to:", out_codes_dir)
 
@@ -452,6 +496,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-#  python img_emb_rqkmeans.py --emb_dir "E:/NUS/data/perdata/train_text_all_samples/cxr_emb_chex0_bucketed" --meta_index "E:/NUS/data/perdata/train_text_all_samples/meta/sample_index.json" --out_dir "E:/NUS/data/perdata/train_text_all_samples/codebook/rqkmeans_cxr_chex0" --epochs 10 --batch_size 1024 --num_emb_list "1024,1024,1024" --ema_decay 0.9 --init_batches 10 --log_every 100 --export_batch_size 4096
+
+#  python img_emb_rqkmeans.py --emb_dir "E:/NUS/data/perdata/train_text_all_samples/cxr_emb_chex0_rebucketed" --meta_index "E:/NUS/data/perdata/train_text_all_samples/meta/sample_index.json" --out_dir "E:/NUS/data/perdata/train_text_all_samples/codebook/rqkmeans_cxr_chex0_v2" --ref_bucket_dir "E:/NUS/data/perdata/train_text_all_samples/tab_embed_v1_mlp" --ref_sid_name "sample_id.npy" --epochs 10 --batch_size 2048 --export_batch_size 4096 --num_emb_list "64,2048,1024" --ema_decay 0.95 --init_batches 10 --log_every 100
 
 

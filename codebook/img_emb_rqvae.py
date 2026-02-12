@@ -166,9 +166,15 @@ class BucketedEmbDataset(Dataset):
         sid = str(self.sids_per_bucket[bi][ri])
         lab = self.sid2lab.get(sid, None)
 
-        # to torch float32 (训练更稳)
-        x = torch.from_numpy(np.asarray(x, dtype=np.float32))
+        x = np.asarray(x, dtype=np.float32).copy()  
+        if not np.isfinite(x).all():
+            bad = np.where(~np.isfinite(x))[0][:10]
+            raise ValueError(f"[BAD X] sid={sid} bi={bi} ri={ri} non-finite at dims {bad} "
+                            f"min={np.nanmin(x)} max={np.nanmax(x)}")
+
+        x = torch.from_numpy(x)
         return x, sid, lab
+
 
 
 import torch.nn as nn
@@ -293,7 +299,18 @@ def train_one_epoch(model, dl, opt, device, use_amp: bool, use_sk: bool, grad_cl
 
 
 @torch.no_grad()
-def export_codes_by_bucket(model, bucket_pairs, out_dir_codes, device, batch_size: int, tag: str, use_sk: bool):
+def export_codes_by_bucket(
+    model,
+    bucket_pairs,
+    out_dir_codes,
+    device,
+    batch_size: int,
+    tag: str,
+    use_sk: bool,
+    ref_bucket_dir: Optional[str] = None,   
+    ref_sid_name: str = "sample_id.npy",    
+    save_aligned_sid: bool = True,          
+):
     os.makedirs(out_dir_codes, exist_ok=True)
     model.eval()
 
@@ -301,12 +318,16 @@ def export_codes_by_bucket(model, bucket_pairs, out_dir_codes, device, batch_siz
     tag_suffix = f"_{tag}" if tag else ""
 
     for emb_path, sid_path, b in bucket_pairs:
+        cur_sids_raw = np.load(sid_path, allow_pickle=True)
+        cur_sids = [str(x).strip() for x in cur_sids_raw]
+
         emb, meta_dict = open_emb_memmap(emb_path)
         n, d = emb.shape
-        codes_list = []
+        assert n == len(cur_sids), f"Mismatch rows: {emb_path} ({n}) vs {sid_path} ({len(cur_sids)})"
 
+        codes_list = []
         for s in range(0, n, batch_size):
-            x = np.asarray(emb[s:s+batch_size], dtype=np.float32)
+            x = np.asarray(emb[s:s + batch_size], dtype=np.float32)
             x = torch.from_numpy(x).to(device)
             idx = model.get_indices(x, use_sk=use_sk)  # (B, n_layers)
             codes_list.append(idx.detach().cpu().numpy().astype(np.int32))
@@ -314,9 +335,50 @@ def export_codes_by_bucket(model, bucket_pairs, out_dir_codes, device, batch_siz
         codes = np.concatenate(codes_list, axis=0)
         assert codes.shape[0] == n
 
-        out_codes = os.path.join(out_dir_codes, f"bucket_{b:03d}{tag_suffix}_codes.npy")
-        np.save(out_codes, codes)
-        print(f"[Export] bucket {b:03d}: codes {codes.shape} -> {out_codes}")
+        out_sids = cur_sids
+        out_codes = codes
+
+        if ref_bucket_dir is not None and len(ref_bucket_dir) > 0:
+            ref_sid_path = os.path.join(ref_bucket_dir, f"bucket_{b:03d}", ref_sid_name)
+            if not os.path.exists(ref_sid_path):
+                raise FileNotFoundError(f"[ref] missing: {ref_sid_path}")
+
+            ref_sids_raw = np.load(ref_sid_path, allow_pickle=True)
+            ref_sids = [str(x).strip() for x in ref_sids_raw]
+
+            # sid -> row index in current
+            cur_pos = {sid: i for i, sid in enumerate(cur_sids)}
+
+            aligned_codes = []
+            missing = 0
+            for sid in ref_sids:
+                j = cur_pos.get(sid, None)
+                if j is None:
+                    missing += 1
+                    continue
+                aligned_codes.append(codes[j])
+
+            aligned_codes = np.asarray(aligned_codes, dtype=np.int32)
+
+            extras = len(set(cur_sids) - set(ref_sids))
+
+            if missing > 0:
+                print(f"[WARN] bucket {b:03d}: {missing} ref_sids not found in current emb bucket (will be dropped).")
+            if extras > 0:
+                print(f"[INFO] bucket {b:03d}: current has {extras} extra sids not in ref (will be dropped).")
+
+            out_sids = ref_sids if save_aligned_sid else out_sids
+            out_codes = aligned_codes
+
+        out_codes_path = os.path.join(out_dir_codes, f"bucket_{b:03d}{tag_suffix}_codes.npy")
+        np.save(out_codes_path, out_codes)
+
+        if save_aligned_sid:
+            out_sid_path = os.path.join(out_dir_codes, f"bucket_{b:03d}{tag_suffix}_sample_id.npy")
+            np.save(out_sid_path, np.asarray(out_sids, dtype=object))
+
+        print(f"[Export] bucket {b:03d}: codes {out_codes.shape} -> {out_codes_path}")
+
 
 
 def main():
@@ -350,6 +412,12 @@ def main():
     ap.add_argument("--quant_loss_weight", default=1.0, type=float)
     ap.add_argument("--dropout", default=0.0, type=float)
     ap.add_argument("--bn", action="store_true")
+
+    ap.add_argument("--ref_bucket_dir", default="", type=str,
+                    help="(optional) dir containing bucket_XXX/sample_id.npy as reference order, e.g. tab_embed_v1_mlp or image bucket dir")
+    ap.add_argument("--ref_sid_name", default="sample_id.npy", type=str,
+                    help="filename inside each bucket dir, default sample_id.npy")
+
 
     ap.add_argument("--seed", default=42, type=int)
     args = ap.parse_args()
@@ -446,12 +514,16 @@ def main():
         device=device,
         batch_size=min(args.batch_size, 4096),
         tag=args.tag,
-        use_sk=args.export_use_sk
+        use_sk=args.export_use_sk,
+        ref_bucket_dir=(args.ref_bucket_dir if args.ref_bucket_dir.strip() else None),
+        ref_sid_name=args.ref_sid_name,
+        save_aligned_sid=True,
     )
+
     print("[Done] exported codes to:", out_codes_dir)
 
 
 if __name__ == "__main__":
     main()
 
-# python img_emb_rqvae.py --emb_dir "E:/NUS/data/perdata/train_text_all_samples/cxr_emb_chex0_bucketed" --meta_index "E:/NUS/data/perdata/train_text_all_samples/meta/sample_index.json" --out_dir "E:/NUS/data/perdata/train_text_all_samples/codebook/rqvae_cxr_chex0" --epochs 10 --batch_size 1024 --lr 2e-4 --weight_decay 1e-4 --use_amp --bn --e_dim 128 --layers "512,256" --num_emb_list "1024,1024,1024" --sk_epsilons "0.0,0.003,0.01" --sk_iters 50
+# python img_emb_rqvae.py --emb_dir "E:/NUS/data/perdata/train_text_all_samples/cxr_emb_chex0_rebucketed" --meta_index "E:/NUS/data/perdata/train_text_all_samples/meta/sample_index.json" --out_dir "E:/NUS/data/perdata/train_text_all_samples/codebook/rqvae_cxr_chex0_v1" --ref_bucket_dir "E:/NUS/data/perdata/train_text_all_samples/tab_embed_v1_mlp" --ref_sid_name "sample_id.npy" --epochs 10 --batch_size 1024 --lr 2e-4 --weight_decay 1e-4 --use_amp --bn --e_dim 128 --layers "512,256" --num_emb_list "2048,1024,512" --sk_epsilons "0.0,0.003,0.01" --sk_iters 50
