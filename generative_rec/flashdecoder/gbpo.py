@@ -7,6 +7,8 @@ from typing import Optional, List, Tuple, Dict, Any
 from types import SimpleNamespace
 from transformers import PreTrainedModel, PretrainedConfig, LogitsProcessor
 
+from loss import compute_sft_loss
+
 class GBPOTrainer:
     def __init__(
         self,

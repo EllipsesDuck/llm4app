@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import DataLoader
 import random
 
-from generative_rec.lazydecoderonly import LazyDecoder, GBPOTrainer,HierarchicalSemanticIDProcessor
+from generative_rec.flashdecoder.flashdecoder import LazyDecoder, GBPOTrainer,HierarchicalSemanticIDProcessor
 from logitprocessor import PrefixTrie
 
 # ===============================
