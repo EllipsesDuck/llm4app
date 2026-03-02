@@ -1023,28 +1023,35 @@ class GBPOTrainer:
         use_auto_prefix: bool = False,
         use_hybrid_prefix: bool = False,
         auto_prefix_mode: str = "linear",
+        # ---- safety knobs ----
+        log_ratio_clip: float = 20.0,   # clamp log(ratio) to avoid exp overflow
+        ratio_clip_max: float = 50.0,   # hard cap ratio (extra safety)
     ):
         self.model = model
-        self.lambda_rl = lambda_rl
-        self.clip_eps = clip_eps
-        self.pad_id = pad_id
-        self.bos_id = bos_id
+        self.lambda_rl = float(lambda_rl)
+        self.clip_eps = float(clip_eps)
+        self.pad_id = int(pad_id)
+        self.bos_id = int(bos_id)
 
         assert gbpo_level in ("sequence", "token")
         self.gbpo_level = gbpo_level
-        self.gbpo_use_clip = gbpo_use_clip
-        self.gbpo_mask_bos = gbpo_mask_bos
+        self.gbpo_use_clip = bool(gbpo_use_clip)
+        self.gbpo_mask_bos = bool(gbpo_mask_bos)
 
         self.device = device or next(model.parameters()).device
         self.semantic_processor = semantic_processor
 
-        self.fixed_prefix_len = fixed_prefix_len
-        self.use_auto_prefix = use_auto_prefix
-        self.use_hybrid_prefix = use_hybrid_prefix
+        self.fixed_prefix_len = int(fixed_prefix_len)
+        self.use_auto_prefix = bool(use_auto_prefix)
+        self.use_hybrid_prefix = bool(use_hybrid_prefix)
 
         assert auto_prefix_mode in ("linear", "cosine", "exp")
         self.auto_prefix_mode = auto_prefix_mode
 
+        self.log_ratio_clip = float(log_ratio_clip)
+        self.ratio_clip_max = float(ratio_clip_max)
+
+        # old policy snapshot
         self.old_model = copy.deepcopy(model).to(self.device)
         self.old_model.eval()
         for p in self.old_model.parameters():
@@ -1064,10 +1071,11 @@ class GBPOTrainer:
     def _decay_exponential(self, progress, max_prefix_len, k=5):
         return max_prefix_len * math.exp(-k * progress)
 
-    def _sequence_mask(self, target_ids: torch.Tensor) -> torch.Tensor:
-        mask = (target_ids != self.pad_id)
+    def _sequence_mask(self, token_ids: torch.Tensor) -> torch.Tensor:
+        # token_ids: (B,T)
+        mask = (token_ids != self.pad_id)
         if self.gbpo_mask_bos:
-            mask = mask & (target_ids != self.bos_id)
+            mask = mask & (token_ids != self.bos_id)
         return mask.float()
 
     def _normalize_advantage(
@@ -1076,6 +1084,7 @@ class GBPOTrainer:
         group_ids: Optional[torch.Tensor] = None,
         eps: float = 1e-5,
     ) -> torch.Tensor:
+        # rewards: (B,)
         if group_ids is None:
             mean = rewards.mean()
             std = rewards.std(unbiased=False)
@@ -1101,48 +1110,95 @@ class GBPOTrainer:
             bos_id=self.bos_id,
         )
 
+    @torch.no_grad()
+    def _compute_logprob_on_ids(
+        self,
+        model: nn.Module,
+        full_ids: torch.Tensor,
+        user_static: Optional[torch.Tensor],
+        short_term: Optional[torch.Tensor],
+        long_term: Optional[torch.Tensor],
+        cross_kpm: Optional[torch.Tensor],
+        *,
+        # we only score the last `T_score` tokens (the generated actions)
+        T_score: int,
+    ) -> torch.Tensor:
+        """
+        Compute per-token logprob on a FIXED sequence (teacher forcing).
+        Returns: logp (B, T_score) aligned to the last T_score tokens in full_ids (excluding the first token).
+        """
+        # model.forward returns logits over all positions
+        out = model(
+            full_ids,
+            user_static,
+            short_term,
+            long_term,
+            cross_key_padding_mask=cross_kpm,
+        )
+        logits = out["logits"]                      # (B, L, V)
+        log_probs = F.log_softmax(logits, dim=-1)   # (B, L, V)
+
+        # next-token prediction: logits at t predicts token at t+1
+        # so we gather labels from full_ids[:, 1:]
+        labels = full_ids[:, 1:]                    # (B, L-1)
+        lp_all = log_probs[:, :-1, :].gather(-1, labels.unsqueeze(-1)).squeeze(-1)  # (B, L-1)
+
+        # keep last T_score positions of lp_all
+        if T_score <= 0:
+            return lp_all[:, :0]
+        return lp_all[:, -T_score:]                 # (B, T_score)
+
     def compute_gbpo_loss_from_logprob(
         self,
-        logp_new: torch.Tensor,
-        logp_old: torch.Tensor,
-        rewards: torch.Tensor,
-        mask: torch.Tensor,
+        logp_new: torch.Tensor,   # (B,T)
+        logp_old: torch.Tensor,   # (B,T)
+        rewards: torch.Tensor,    # (B,) or (B,T)
+        mask: torch.Tensor,       # (B,T) float(0/1)
         group_ids: Optional[torch.Tensor] = None,
-    ):
+    ) -> torch.Tensor:
+        # rewards -> sequence reward if needed
         if rewards.dim() == 2:
             seq_reward = (rewards * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-5)
         else:
             seq_reward = rewards
 
-        A = self._normalize_advantage(seq_reward, group_ids)
+        A = self._normalize_advantage(seq_reward, group_ids)  # (B,)
 
+        # ---- compute ratio safely ----
         if self.gbpo_level == "sequence":
-            logp_new_seq = (logp_new * mask).sum(dim=1)
-            logp_old_seq = (logp_old * mask).sum(dim=1)
-            ratio = torch.exp(logp_new_seq - logp_old_seq)
+            logp_new_seq = (logp_new * mask).sum(dim=1)  # (B,)
+            logp_old_seq = (logp_old * mask).sum(dim=1)  # (B,)
+            log_ratio = (logp_new_seq - logp_old_seq).clamp(-self.log_ratio_clip, self.log_ratio_clip)
+            ratio = torch.exp(log_ratio).clamp(max=self.ratio_clip_max)
 
-            if self.gbpo_use_clip:
-                ratio_clip = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
-                loss_unclipped = -(ratio * A)
-                loss_clipped = -(ratio_clip * A)
-                loss = torch.max(loss_unclipped, loss_clipped).mean()
-            else:
-                loss = -(ratio * A).mean()
+            if not self.gbpo_use_clip:
+                return -(ratio * A).mean()
+
+            ratio_clip = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
+
+            # PPO objective with sign-aware clipping
+            obj1 = ratio * A
+            obj2 = ratio_clip * A
+            obj = torch.where(A >= 0, torch.minimum(obj1, obj2), torch.maximum(obj1, obj2))
+            loss = -obj.mean()
             return loss
 
-        log_ratio = logp_new - logp_old
-        ratio_tok = torch.exp(log_ratio)
-        adv_tok = A.unsqueeze(1).expand_as(mask)
+        # token-level
+        log_ratio_tok = (logp_new - logp_old).clamp(-self.log_ratio_clip, self.log_ratio_clip)  # (B,T)
+        ratio_tok = torch.exp(log_ratio_tok).clamp(max=self.ratio_clip_max)
+        adv_tok = A.unsqueeze(1).expand_as(mask)  # (B,T)
 
-        if self.gbpo_use_clip:
-            ratio_clip = torch.clamp(ratio_tok, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
-            loss_unclipped = -(ratio_tok * adv_tok)
-            loss_clipped = -(ratio_clip * adv_tok)
-            loss_tok = torch.max(loss_unclipped, loss_clipped)
-        else:
-            loss_tok = -(ratio_tok * adv_tok)
+        if not self.gbpo_use_clip:
+            loss_tok = -(ratio_tok * adv_tok) * mask
+            return loss_tok.sum() / mask.sum().clamp_min(1.0)
 
-        loss_tok = loss_tok * mask
+        ratio_clip = torch.clamp(ratio_tok, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
+
+        obj1 = ratio_tok * adv_tok
+        obj2 = ratio_clip * adv_tok
+        obj = torch.where(adv_tok >= 0, torch.minimum(obj1, obj2), torch.maximum(obj1, obj2))
+
+        loss_tok = -(obj) * mask
         return loss_tok.sum() / mask.sum().clamp_min(1.0)
 
     def compute_auto_prefix_len(self, step, total_steps, max_prefix_len):
@@ -1158,7 +1214,6 @@ class GBPOTrainer:
         return int(max(val, 0))
 
     def compute_hybrid_prefix_len(self, prefix_len):
-        import random
         if random.random() < 0.5:
             return 0
         return prefix_len
@@ -1188,6 +1243,7 @@ class GBPOTrainer:
         if cross_kpm is not None:
             cross_kpm = cross_kpm.to(self.device)
 
+        # ----- supervised forward (for CE) -----
         out_new = self.model(
             target_ids,
             user_static,
@@ -1196,13 +1252,11 @@ class GBPOTrainer:
             cross_key_padding_mask=cross_kpm,
         )
         logits_new = out_new["logits"]
-
         loss_ce = self.compute_supervised_loss(logits_new, target_ids)
 
-        if not use_rl:
-            loss = loss_ce
-            loss_gbpo = torch.tensor(0.0, device=self.device)
-        else:
+        loss_gbpo = torch.tensor(0.0, device=self.device)
+
+        if use_rl:
             B = target_ids.size(0)
             prefix_len = self.fixed_prefix_len
 
@@ -1221,14 +1275,14 @@ class GBPOTrainer:
             else:
                 start_ids = target_ids[:, :prefix_len]
 
-            max_new = batch.get("max_new_tokens", 3)
-            temperature = batch.get("temperature", 1.0)
+            max_new = int(batch.get("max_new_tokens", 3))
+            temperature = float(batch.get("temperature", 1.0))
             eos_id = batch.get("eos_id", None)
-
             lp = [self.semantic_processor] if self.semantic_processor is not None else None
 
+            # ---- sample ONCE from current policy ----
             with torch.no_grad():
-                gen_ids, logp_new, _ = self.model.generate_with_logprobs(
+                gen_ids, _, _ = self.model.generate_with_logprobs(
                     input_ids=start_ids,
                     user_static=user_static,
                     short_term=short_term,
@@ -1240,29 +1294,37 @@ class GBPOTrainer:
                     logits_processor=lp,
                 )
 
-                _, logp_old, _ = self.old_model.generate_with_logprobs(
-                    input_ids=start_ids,
-                    user_static=user_static,
-                    short_term=short_term,
-                    long_term=long_term,
-                    cross_key_padding_mask=cross_kpm,
-                    max_new_tokens=max_new,
-                    temperature=temperature,
-                    eos_id=eos_id,
-                    logits_processor=lp,
+            # actions are the newly generated tokens after the prefix (exclude the first token in gen_ids which is BOS/prefix start)
+            # we want to score exactly T = gen_len-1 tokens? but we only want the "newly generated" portion.
+            # define action span = last max_new tokens actually generated (may stop early at EOS)
+            # Here: score the last (gen_ids.size(1) - start_ids.size(1)) tokens, i.e. generated continuation.
+            T_score = int(gen_ids.size(1) - start_ids.size(1))
+            if T_score < 0:
+                T_score = 0
+
+            # full sequence to score = gen_ids
+            with torch.no_grad():
+                logp_new = self._compute_logprob_on_ids(
+                    self.model, gen_ids, user_static, short_term, long_term, cross_kpm,
+                    T_score=T_score
+                )
+                logp_old = self._compute_logprob_on_ids(
+                    self.old_model, gen_ids, user_static, short_term, long_term, cross_kpm,
+                    T_score=T_score
                 )
 
-            rewards = batch["rewards"].to(self.device)
+            rewards = batch["rewards"].to(self.device)  # you decide reward shape (B,) or (B,T)
             group_ids = batch.get("group_ids", None)
             if group_ids is not None:
                 group_ids = group_ids.to(self.device)
 
-            logp_new = logp_new.detach()
-            logp_old = logp_old.detach()
-
-            T = logp_new.size(1)
-            action_ids = gen_ids[:, 1:1 + T]
-            mask = self._sequence_mask(action_ids)
+            # mask computed on the SAME action tokens we scored
+            # action token ids are the last T_score tokens in gen_ids (excluding prefix)
+            if T_score > 0:
+                action_ids = gen_ids[:, -T_score:]
+                mask = self._sequence_mask(action_ids)
+            else:
+                mask = torch.zeros((B, 0), device=self.device)
 
             loss_gbpo = self.compute_gbpo_loss_from_logprob(
                 logp_new=logp_new,
@@ -1272,9 +1334,9 @@ class GBPOTrainer:
                 group_ids=group_ids,
             )
 
-            loss = loss_ce + self.lambda_rl * loss_gbpo
+        loss = loss_ce + (self.lambda_rl * loss_gbpo if use_rl else 0.0)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
