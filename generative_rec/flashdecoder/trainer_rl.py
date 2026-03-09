@@ -16,7 +16,6 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
-# flashdecoderv3 里是你发我的模型代码：LazyDecoder + compute_sft_loss + GBPOTrainer + generate_with_logprobs(...)
 from flashdecoderv3 import LazyDecoder, compute_sft_loss, GBPOTrainer
 
 
@@ -368,7 +367,7 @@ def collate_fn(batch: List[Dict[str, Any]]):
 
 
 # ----------------------------
-# Model wrapper (adapters + label head) + RL generate wrapper
+# Model wrapper
 # ----------------------------
 class FlashDecoderSFT(nn.Module):
     def __init__(
@@ -458,7 +457,6 @@ class FlashDecoderSFT(nn.Module):
             raise ValueError(f"which must be 'bos' or 'last', got {which}")
         return self.label_head(h)
 
-    # ---- RL 关键：给 GBPOTrainer 用（它会调用 self.model.generate_with_logprobs）----
     @torch.no_grad()
     def generate_with_logprobs(
         self,
@@ -492,29 +490,69 @@ class FlashDecoderSFT(nn.Module):
 
 
 # ----------------------------
-# Reward (simple & convenient)
-# reward = - masked BCE(label_head(last_hidden(gen_seq)), y)
+# Reward components (B方案)
 # ----------------------------
 @torch.no_grad()
-def compute_rewards_label_bce(
+def compute_reward_label_bce(
     model: FlashDecoderSFT,
-    gen_ids: torch.Tensor,          # (B, Tgen)
+    seq_ids: torch.Tensor,          # (B, T)
     user_static: torch.Tensor,
     short_term: torch.Tensor,
     y: torch.Tensor,                # (B,C) in {-1,0,1}
     label_ignore: float = -1.0,
+    which_hidden: str = "last",     # last is default
 ) -> torch.Tensor:
-    out = model.forward_with_hidden(gen_ids, user_static, short_term, None)
+    """
+    r_lab = - masked BCE(label_head(hidden(seq)), y)
+    """
+    out = model.forward_with_hidden(seq_ids, user_static, short_term, None)
     hidden = out["hidden"]
-    y_logit = model.logits_to_label(hidden, which="last")  # (B,C)
+    y_logit = model.logits_to_label(hidden, which=which_hidden)  # (B,C)
     if y_logit is None:
-        return torch.zeros((gen_ids.size(0),), device=gen_ids.device)
+        return torch.zeros((seq_ids.size(0),), device=seq_ids.device)
 
     mask = (y != label_ignore).float()
     y01 = (y > 0).float()
     bce = F.binary_cross_entropy_with_logits(y_logit, y01, reduction="none")  # (B,C)
     per_sample = (bce * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)    # (B,)
     return -per_sample
+
+
+@torch.no_grad()
+def compute_reward_token_match(
+    gen_ids: torch.Tensor,          # (B, Tgen)
+    target_ids: torch.Tensor,       # (B, Ttrue)
+    *,
+    code_len: int,
+    pad_id: int,
+) -> torch.Tensor:
+    """
+    r_tok = mean_{t=1..code_len} [gen_code_t == true_code_t], in [0,1]
+    - 只比对 code_len 个 code token（不比对 EOS）
+    - 如果 gen_ids 太短会 pad
+    """
+    B = target_ids.size(0)
+
+    need_len = 1 + int(code_len)  # BOS + code_len
+    if gen_ids.size(1) < need_len:
+        pad_more = need_len - gen_ids.size(1)
+        gen_ids = torch.cat(
+            [gen_ids, torch.full((B, pad_more), int(pad_id), device=gen_ids.device, dtype=torch.long)],
+            dim=1
+        )
+
+    true_codes = target_ids[:, 1:1 + int(code_len)]
+    pred_codes = gen_ids[:, 1:1 + int(code_len)]
+    eq = (pred_codes == true_codes).float()  # (B, L)
+    return eq.mean(dim=1)                    # (B,)
+
+
+def normalize_reward(r: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    if r.numel() <= 1:
+        return r
+    mu = r.mean()
+    sd = r.std(unbiased=False).clamp_min(eps)
+    return (r - mu) / sd
 
 
 # ----------------------------
@@ -681,7 +719,7 @@ def eval_split(
 
 
 # ----------------------------
-# Train: SFT (保持你原来的写法)
+# Train: SFT
 # ----------------------------
 def train_one_epoch_sft(
     model: FlashDecoderSFT,
@@ -721,40 +759,18 @@ def train_one_epoch_sft(
             logits = out["logits"]
             hidden = out["hidden"]
 
-            if global_step <= 2:
-                print("\n[DEBUG] target_ids[0]:", target_ids[0].tolist())
-                print("[DEBUG] unique target_ids:", torch.unique(target_ids))
-                print("[DEBUG] pad_id =", pad_id, "bos_id =", bos_id)
-
             if torch.isnan(logits).any():
                 print("❌ [FATAL] logits has NaN")
                 print("logits range:", logits.min().item(), logits.max().item())
                 raise RuntimeError("NaN logits detected")
-
-            if (target_ids < 0).any():
-                raise RuntimeError("Invalid target_ids (<0)")
-
-            if (target_ids >= logits.size(-1)).any():
-                print("❌ [FATAL] target_ids >= vocab_size")
-                print("max target:", target_ids.max().item(), "vocab:", logits.size(-1))
-                raise RuntimeError("Invalid target_ids (>= vocab_size)")
-
-            with torch.no_grad():
-                loss_mask = (target_ids != pad_id)
-                if bos_id is not None:
-                    loss_mask = loss_mask & (target_ids != bos_id)
-                if loss_mask.sum() == 0:
-                    raise RuntimeError("Empty loss mask → lm_loss will be NaN")
 
             loss_lm = compute_sft_loss(logits, target_ids, pad_id=pad_id, bos_id=bos_id)
 
             loss_cls = torch.tensor(0.0, device=device)
             if (alpha_cls is not None) and (alpha_cls > 0) and model.use_label_head:
                 y_logit = model.logits_to_label(hidden, which="last")  # (B,C)
-
                 mask = (y != -1).float()
                 y01 = (y > 0).float()
-
                 bce = F.binary_cross_entropy_with_logits(y_logit, y01, reduction="none")  # (B,C)
                 loss_cls = (bce * mask).sum() / mask.sum().clamp_min(1.0)
 
@@ -792,7 +808,7 @@ def train_one_epoch_sft(
 
 
 # ----------------------------
-# Train: GBPO RL (直接用 GBPOTrainer.train_step)
+# Train: GBPO RL (B方案 reward)
 # ----------------------------
 def train_one_epoch_gbpo(
     model: FlashDecoderSFT,
@@ -805,8 +821,13 @@ def train_one_epoch_gbpo(
     eos_id: int,
     label_ignore: float,
     *,
+    code_len: int,
     max_new_tokens: int,
     temperature: float,
+    reward_tok_w: float,
+    reward_lab_w: float,
+    reward_norm: bool = False,
+    reward_scale: float = 1.0,
     sync_old_every: int = 100,
     writer: Optional[SummaryWriter] = None,
     log_every: int = 10,
@@ -819,6 +840,11 @@ def train_one_epoch_gbpo(
     total_gbpo = 0.0
     n = 0
 
+    # 额外记录一下 reward 组件（方便你在 TB 看）
+    r_tok_sum = 0.0
+    r_lab_sum = 0.0
+    r_mix_sum = 0.0
+
     pbar = tqdm(dl_tr, desc="train_gbpo", leave=False)
     for batch in pbar:
         global_step += 1
@@ -828,7 +854,7 @@ def train_one_epoch_gbpo(
         short_term = batch["short_term"].to(device, non_blocking=True)
         y = batch["y"].to(device, non_blocking=True)
 
-        # 1) 先 rollout 一次用于算 reward（不求梯度）
+        # 1) rollout for reward (no grad)
         with torch.no_grad():
             B = target_ids.size(0)
             if gbpo.fixed_prefix_len <= 0:
@@ -848,16 +874,30 @@ def train_one_epoch_gbpo(
                 cross_key_padding_mask=None,
             )
 
-            rewards = compute_rewards_label_bce(
-                model=model,
+            # ---- B方案 reward ----
+            r_tok = compute_reward_token_match(
                 gen_ids=gen_ids,
+                target_ids=target_ids,
+                code_len=int(code_len),
+                pad_id=int(pad_id),
+            )
+            r_lab = compute_reward_label_bce(
+                model=model,
+                seq_ids=gen_ids,
                 user_static=user_static,
                 short_term=short_term,
                 y=y,
-                label_ignore=label_ignore,
+                label_ignore=float(label_ignore),
+                which_hidden="last",
             )
 
-        # 2) GBPOTrainer 需要的 batch
+            rewards = float(reward_tok_w) * r_tok + float(reward_lab_w) * r_lab
+
+            if reward_norm:
+                rewards = normalize_reward(rewards)
+            rewards = rewards * float(reward_scale)
+
+        # 2) GBPO train step
         batch_rl = {
             "target_ids": target_ids,
             "user_static": user_static,
@@ -883,11 +923,18 @@ def train_one_epoch_gbpo(
         total_gbpo += stats["loss_gbpo"] * bs
         n += bs
 
+        # 记录 reward 组件均值
+        r_tok_sum += float(r_tok.mean().item()) * bs
+        r_lab_sum += float(r_lab.mean().item()) * bs
+        r_mix_sum += float(rewards.mean().item()) * bs
+
         pbar.set_postfix(
             loss=f"{stats['loss']:.4f}",
             ce=f"{stats['loss_ce']:.4f}",
             gbpo=f"{stats['loss_gbpo']:.4f}",
             r=f"{float(rewards.mean().item()):.3f}",
+            rt=f"{float(r_tok.mean().item()):.3f}",
+            rl=f"{float(r_lab.mean().item()):.3f}",
         )
 
         if writer is not None and (global_step % max(1, log_every) == 0):
@@ -895,12 +942,17 @@ def train_one_epoch_gbpo(
             writer.add_scalar("train_gbpo/loss_ce_step", stats["loss_ce"], global_step)
             writer.add_scalar("train_gbpo/loss_gbpo_step", stats["loss_gbpo"], global_step)
             writer.add_scalar("train_gbpo/reward_mean", float(rewards.mean().item()), global_step)
+            writer.add_scalar("train_gbpo/reward_tok_mean", float(r_tok.mean().item()), global_step)
+            writer.add_scalar("train_gbpo/reward_lab_mean", float(r_lab.mean().item()), global_step)
             writer.add_scalar("train_gbpo/lr", opt.param_groups[0]["lr"], global_step)
 
     out = {
         "loss": total / max(1, n),
         "loss_ce": total_ce / max(1, n),
         "loss_gbpo": total_gbpo / max(1, n),
+        "reward_tok_mean": r_tok_sum / max(1, n),
+        "reward_lab_mean": r_lab_sum / max(1, n),
+        "reward_mix_mean": r_mix_sum / max(1, n),
     }
     return out, global_step
 
@@ -944,6 +996,9 @@ def main():
     ap.add_argument("--no_label_head", action="store_true")
 
     ap.add_argument("--out_ckpt", type=str, required=True)
+    ap.add_argument("--init_ckpt", type=str, default="", help="warm start from this ckpt (e.g. basebest.pt)")
+    ap.add_argument("--strict_init", action="store_true", help="strict load for init_ckpt (default False -> allow mismatch)")
+
     ap.add_argument("--log_dir", default="", type=str)
     ap.add_argument("--exp_name", default="", type=str)
     ap.add_argument("--run_id", default="", type=str)
@@ -968,6 +1023,13 @@ def main():
     ap.add_argument("--rl_temperature", type=float, default=1.0)
     ap.add_argument("--sync_old_every", type=int, default=100)
 
+    ap.add_argument("--reward_norm", action="store_true", help="z-score normalize reward per batch")
+    ap.add_argument("--reward_scale", type=float, default=1.0, help="scale reward after (optional) normalization")
+
+    # ---- B方案 reward 权重 ----
+    ap.add_argument("--reward_tok_w", type=float, default=1.0, help="weight for token-match reward (0~1)")
+    ap.add_argument("--reward_lab_w", type=float, default=0.1, help="weight for label BCE reward (negative loss)")
+
     args = ap.parse_args()
 
     roc_auc_score, _ = try_import_sklearn_metrics()
@@ -975,7 +1037,7 @@ def main():
         print("[Warn] sklearn not found. Install: pip install scikit-learn (AUC/F1 -> NaN)")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    use_amp = args.fp16 and (device == "cuda") and (not args.use_rl)  # RL 分支不走 AMP（GBPOTrainer 内部未做 amp）
+    use_amp = args.fp16 and (device == "cuda") and (not args.use_rl)  # RL 分支不走 AMP
     print(f"[Info] device={device}, amp={use_amp}, use_rl={bool(args.use_rl)}")
 
     set_seed(args.seed)
@@ -994,9 +1056,9 @@ def main():
     exp = args.exp_name.strip()
     if not exp:
         exp = (
-            f"flashdecoder_{'gbpo' if args.use_rl else 'sft'}_ctx{args.ctx_dim}_dm{args.d_model}_L{args.n_layers}_H{args.n_heads_q}_g{args.gkv}_"
-            f"bs{args.batch_size}_lr{args.lr}_wd{args.wd}_fp16{int(args.fp16)}_aCls{args.alpha_cls}_off{args.code_offset}_"
-            f"lam{args.lambda_rl}_clip{args.clip_eps}_mx{args.rl_max_new_tokens}"
+            f"flashdecoder_{'gbpoB' if args.use_rl else 'sft'}_ctx{args.ctx_dim}_dm{args.d_model}_L{args.n_layers}_H{args.n_heads_q}_g{args.gkv}_"
+            f"bs{args.batch_size}_lr{args.lr}_wd{args.wd}_fp16{int(args.fp16)}_off{args.code_offset}_"
+            f"lam{args.lambda_rl}_clip{args.clip_eps}_mx{args.rl_max_new_tokens}_rt{args.reward_tok_w}_rl{args.reward_lab_w}"
         )
     run_id = args.run_id.strip() if args.run_id.strip() else datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1092,6 +1154,18 @@ def main():
         use_label_head=(not args.no_label_head),
     ).to(device)
 
+    # ----------------------------
+    # ✅ warm start
+    # ----------------------------
+    if args.init_ckpt and os.path.exists(args.init_ckpt):
+        ckpt0 = torch.load(args.init_ckpt, map_location=device)
+        sd = ckpt0.get("state_dict", ckpt0)  # 兼容：ckpt 可能直接就是 state_dict
+        strict = bool(args.strict_init)
+        missing, unexpected = model.load_state_dict(sd, strict=strict)
+        print(f"[Init] loaded init_ckpt: {args.init_ckpt} (strict={strict})")
+        if (not strict) and (len(missing) or len(unexpected)):
+            print(f"[Init] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
     gbpo = None
@@ -1146,8 +1220,13 @@ def main():
                 bos_id=args.bos_id,
                 eos_id=args.eos_id,
                 label_ignore=args.label_ignore,
+                code_len=code_len,
                 max_new_tokens=args.rl_max_new_tokens,
                 temperature=args.rl_temperature,
+                reward_tok_w=float(args.reward_tok_w),
+                reward_lab_w=float(args.reward_lab_w),
+                reward_norm=bool(args.reward_norm),
+                reward_scale=float(args.reward_scale),
                 sync_old_every=args.sync_old_every,
                 writer=writer,
                 log_every=args.log_every,
@@ -1156,6 +1235,9 @@ def main():
             writer.add_scalar("loss/train_epoch", tr_stats["loss"], global_step)
             writer.add_scalar("loss/train_ce_epoch", tr_stats["loss_ce"], global_step)
             writer.add_scalar("loss/train_gbpo_epoch", tr_stats["loss_gbpo"], global_step)
+            writer.add_scalar("reward/train_tok_epoch", tr_stats["reward_tok_mean"], global_step)
+            writer.add_scalar("reward/train_lab_epoch", tr_stats["reward_lab_mean"], global_step)
+            writer.add_scalar("reward/train_mix_epoch", tr_stats["reward_mix_mean"], global_step)
 
         te = eval_split(
             model, dl_te, device,
@@ -1187,7 +1269,6 @@ def main():
             acc_vals.append(f"{te.get(k, float('nan')):.3f}")
         acc_str = ", ".join(acc_vals)
 
-        # 打印 epoch summary
         if not args.use_rl:
             print(
                 f"[Epoch {ep:02d}] "
@@ -1203,6 +1284,7 @@ def main():
             print(
                 f"[Epoch {ep:02d}] "
                 f"train_loss={tr_stats['loss']:.4f} (ce={tr_stats['loss_ce']:.4f}, gbpo={tr_stats['loss_gbpo']:.4f}) | "
+                f"reward(tok/lab/mix)={tr_stats['reward_tok_mean']:.3f}/{tr_stats['reward_lab_mean']:.3f}/{tr_stats['reward_mix_mean']:.3f} | "
                 f"test_lm={te['lm_loss']:.4f} "
                 f"free_macroAUC={te.get('free_macro_auc', float('nan')):.4f} free_microAUC={te.get('free_micro_auc', float('nan')):.4f} "
                 f"free_macroF1={te.get('free_macro_f1', float('nan')):.4f} free_microF1={te.get('free_micro_f1', float('nan')):.4f} | "
@@ -1287,12 +1369,4 @@ if __name__ == "__main__":
 
 
 
-
-
-
-
-
-
-
-
-# python trainer_rl.py --epochs 5 --batch_size 128 --lr 2e-4 --wd 0.01 --num_workers 0 --code_offset 3 --thr 0.2 --label_ignore -1 --use_rl --lambda_rl 0.1 --clip_eps 0.2 --gbpo_level sequence --gbpo_use_clip --fixed_prefix_len 0 --rl_max_new_tokens 3 --rl_temperature 1.0 --sync_old_every 100 --out_ckpt "E:\NUS\data\perdata\train_text_all_samples\ckpts\flashdecoder_sft_v1\best_rl.pt"
+# python trainer_rl.py --use_rl --init_ckpt "E:\NUS\data\perdata\train_text_all_samples\ckpts\flashdecoder_sft_v1\basebest.pt" --epochs 5 --batch_size 128 --lr 5e-5 --wd 0.01 --num_workers 0 --code_offset 3 --thr 0.2 --label_ignore -1 --lambda_rl 0.02 --clip_eps 0.1 --gbpo_level sequence --gbpo_use_clip --fixed_prefix_len 1 --rl_max_new_tokens 3 --rl_temperature 1.0 --sync_old_every 50 --reward_norm --reward_scale 1.0 --reward_tok_w 1.0 --reward_lab_w 0.1 --out_ckpt "E:\NUS\data\perdata\train_text_all_samples\ckpts\flashdecoder_rl_v1\best_rl_B.pt"
